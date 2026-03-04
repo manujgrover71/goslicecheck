@@ -11,6 +11,13 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
+type loopDirection int
+
+const (
+	loopForward loopDirection = iota
+	loopReverse
+)
+
 var Analyzer = &analysis.Analyzer{
 	Name: "goslicecheck",
 	Doc:  "detects slices that can be preallocated",
@@ -21,11 +28,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 	for _, file := range pass.Files {
 
-		// Build a list of statements at the file's top-level function bodies
-		// so we can look at the statement before a range loop.
 		ast.Inspect(file, func(n ast.Node) bool {
 
-			// We want to visit block statements so we can inspect neighbours.
 			block, ok := n.(*ast.BlockStmt)
 			if !ok {
 				return true
@@ -33,51 +37,92 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 			for i, stmt := range block.List {
 
-				// Look for range loops
-				rangeStmt, ok := stmt.(*ast.RangeStmt)
-				if !ok {
-					continue
+				var iterExpr ast.Expr
+
+				switch s := stmt.(type) {
+				case *ast.RangeStmt:
+					// --- existing range loop handling ---
+					iterType := pass.TypesInfo.TypeOf(s.X)
+					if iterType == nil {
+						continue
+					}
+					if _, isSlice := iterType.(*types.Slice); !isSlice {
+						continue
+					}
+					iterExpr = s.X
+
+					targetName, found := findAppendTarget(s.Body)
+					if !found {
+						continue
+					}
+
+					iterStr := exprString(iterExpr)
+					if isAlreadyPreallocated(block.List, i, targetName, iterStr) {
+						continue
+					}
+
+					elemType := findSliceElemType(pass, s.Body, targetName)
+					makeExpr := fmt.Sprintf("make([]%s, 0, len(%s))", elemType, iterStr)
+					fix := buildFix(pass, block.List, i, targetName, makeExpr, s.Pos())
+
+					pass.Report(analysis.Diagnostic{
+						Pos:            s.Pos(),
+						Message:        fmt.Sprintf("slice '%s' can be preallocated with capacity len(%s)", targetName, iterStr),
+						SuggestedFixes: []analysis.SuggestedFix{fix},
+					})
+
+				case *ast.ForStmt:
+					// --- new: traditional for loop ---
+					sliceName, loopKind, ok := extractForLoopSlice(s)
+					if !ok {
+						continue
+					}
+
+					// For forward loops the slice appears in the condition (i < len(s)),
+					// for reverse loops it appears in the init (i := len(s)).
+					var searchExpr ast.Expr
+					if loopKind == loopForward {
+						searchExpr = s.Cond
+					} else {
+						searchExpr = s.Init.(*ast.AssignStmt).Rhs[0] // len(s) or len(s)-1
+					}
+
+					// Resolve the slice ident to confirm it's actually a slice type.
+					sliceIdent := findIdentInExpr(searchExpr, sliceName)
+					if sliceIdent == nil {
+						continue
+					}
+
+					iterType := pass.TypesInfo.TypeOf(sliceIdent)
+					if iterType == nil {
+						continue
+					}
+					if _, isSlice := iterType.(*types.Slice); !isSlice {
+						continue
+					}
+
+					iterExpr = sliceIdent
+
+					targetName, found := findAppendTarget(s.Body)
+					if !found {
+						continue
+					}
+
+					iterStr := exprString(iterExpr)
+					if isAlreadyPreallocated(block.List, i, targetName, iterStr) {
+						continue
+					}
+
+					elemType := findSliceElemType(pass, s.Body, targetName)
+					makeExpr := fmt.Sprintf("make([]%s, 0, len(%s))", elemType, iterStr)
+					fix := buildFix(pass, block.List, i, targetName, makeExpr, s.Pos())
+
+					pass.Report(analysis.Diagnostic{
+						Pos:            s.Pos(),
+						Message:        fmt.Sprintf("slice '%s' can be preallocated with capacity len(%s)", targetName, iterStr),
+						SuggestedFixes: []analysis.SuggestedFix{fix},
+					})
 				}
-
-				iterExpr := rangeStmt.X
-
-				// Check if iterated type is slice
-				iterType := pass.TypesInfo.TypeOf(iterExpr)
-				if iterType == nil {
-					continue
-				}
-
-				_, isSlice := iterType.(*types.Slice)
-				if !isSlice {
-					continue
-				}
-
-				// Look inside loop body for append pattern
-				targetName, found := findAppendTarget(rangeStmt)
-				if !found {
-					continue
-				}
-
-				iterStr := exprString(iterExpr)
-
-				// Skip if the slice is already preallocated with make(..., len(<iterExpr>))
-				if isAlreadyPreallocated(block.List, i, targetName, iterStr) {
-					continue
-				}
-
-				// Find the element type of the target slice so we can build make([]T, 0, len(...))
-				elemType := findSliceElemType(pass, rangeStmt, targetName)
-
-				makeExpr := fmt.Sprintf("make([]%s, 0, len(%s))", elemType, iterStr)
-
-				// Try to find and replace the declaration of targetName just before the range loop.
-				fix := buildFix(pass, block.List, i, targetName, makeExpr, rangeStmt.Pos())
-
-				pass.Report(analysis.Diagnostic{
-					Pos:            rangeStmt.Pos(),
-					Message:        fmt.Sprintf("slice '%s' can be preallocated with capacity len(%s)", targetName, iterStr),
-					SuggestedFixes: []analysis.SuggestedFix{fix},
-				})
 			}
 
 			return true
@@ -89,8 +134,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 // findAppendTarget returns the name of the slice being built via append inside
 // the range body, if the pattern  `s = append(s, ...)` is found.
-func findAppendTarget(rangeStmt *ast.RangeStmt) (string, bool) {
-	for _, stmt := range rangeStmt.Body.List {
+func findAppendTarget(body *ast.BlockStmt) (string, bool) {
+	for _, stmt := range body.List {
 
 		assignStmt, ok := stmt.(*ast.AssignStmt)
 		if !ok {
@@ -138,7 +183,7 @@ func findAppendTarget(rangeStmt *ast.RangeStmt) (string, bool) {
 // the slice ident (Args[0] of the append call) in TypesInfo.Uses.
 // Using Uses[ident] on the slice variable avoids TypeOf on composite literals,
 // which returns fully-qualified package paths like "pkg.UserDTO".
-func findSliceElemType(pass *analysis.Pass, rangeStmt *ast.RangeStmt, name string) string {
+func findSliceElemType(pass *analysis.Pass, body *ast.BlockStmt, name string) string {
 	// Omit current package prefix; use short name for external packages.
 	qualifier := func(pkg *types.Package) string {
 		if pkg == pass.Pkg {
@@ -147,7 +192,7 @@ func findSliceElemType(pass *analysis.Pass, rangeStmt *ast.RangeStmt, name strin
 		return pkg.Name()
 	}
 
-	for _, stmt := range rangeStmt.Body.List {
+	for _, stmt := range body.List {
 		assign, ok := stmt.(*ast.AssignStmt)
 		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
 			continue
@@ -343,4 +388,225 @@ func exprString(expr ast.Expr) string {
 	var buf bytes.Buffer
 	_ = printer.Fprint(&buf, token.NewFileSet(), expr)
 	return buf.String()
+}
+
+// extractForLoopSlice inspects a traditional for loop's condition and returns
+// the slice/array name + its len-expression if the loop has a canonical form
+// whose iteration count is determined by len(x):
+//
+//	Forward:  for i := 0; i < len(s); i++
+//	          for i := 0; i <= len(s)-1; i++
+//	          for i := 0; len(s) > i; i++
+//
+//	Reverse:  for i := len(s) - 1; i >= 0; i--
+//	          for i := len(s);     i > 0;  i--
+//	          for i := len(s);     i >= 1; i--
+func extractForLoopSlice(forStmt *ast.ForStmt) (sliceName string, direction loopDirection, ok bool) {
+	if forStmt.Init == nil || forStmt.Cond == nil || forStmt.Post == nil {
+		return "", 0, false
+	}
+
+	initAssign, ok := forStmt.Init.(*ast.AssignStmt)
+	if !ok || initAssign.Tok != token.DEFINE ||
+		len(initAssign.Lhs) != 1 || len(initAssign.Rhs) != 1 {
+		return "", 0, false
+	}
+	indexIdent, ok := initAssign.Lhs[0].(*ast.Ident)
+	if !ok {
+		return "", 0, false
+	}
+
+	if isIntLit(initAssign.Rhs[0], "0") && isIncrement(forStmt.Post, indexIdent.Name) {
+		name, ok := extractLenArgFromUpperBound(forStmt.Cond, indexIdent.Name)
+		return name, loopForward, ok
+	}
+
+	if isDecrement(forStmt.Post, indexIdent.Name) {
+		name, ok := extractLenArgFromInit(initAssign.Rhs[0])
+		if !ok {
+			return "", 0, false
+		}
+		if !reverseCondIsValid(forStmt.Cond, indexIdent.Name) {
+			return "", 0, false
+		}
+		return name, loopReverse, true
+	}
+
+	return "", 0, false
+}
+
+// extractLenArgFromUpperBound handles the condition side of forward loops.
+// Accepts:  i < len(s)   |   len(s) > i   |   i <= len(s)-1   |   len(s)-1 >= i
+func extractLenArgFromUpperBound(cond ast.Expr, indexName string) (string, bool) {
+	bin, ok := cond.(*ast.BinaryExpr)
+	if !ok {
+		return "", false
+	}
+
+	switch bin.Op {
+	case token.LSS: // i < len(s)
+		if !isIdent(bin.X, indexName) {
+			return "", false
+		}
+		return lenCallArg(bin.Y)
+
+	case token.GTR: // len(s) > i
+		if !isIdent(bin.Y, indexName) {
+			return "", false
+		}
+		return lenCallArg(bin.X)
+
+	case token.LEQ: // i <= len(s)-1
+		if !isIdent(bin.X, indexName) {
+			return "", false
+		}
+		return lenCallArgMinusOne(bin.Y)
+
+	case token.GEQ: // len(s)-1 >= i
+		if !isIdent(bin.Y, indexName) {
+			return "", false
+		}
+		return lenCallArgMinusOne(bin.X)
+	}
+
+	return "", false
+}
+
+// extractLenArgFromInit handles the init RHS of reverse loops.
+// Accepts:  len(s)   |   len(s) - 1
+func extractLenArgFromInit(expr ast.Expr) (string, bool) {
+	// Plain len(s)
+	if name, ok := lenCallArg(expr); ok {
+		return name, true
+	}
+	// len(s) - 1
+	return lenCallArgMinusOne(expr)
+}
+
+// reverseCondIsValid checks that the condition of a reverse loop compares the
+// index variable against a small non-negative constant (0 or 1), ensuring the
+// loop count is still fully determined by len(s).
+//
+// Accepts:  i >= 0  |  i > 0  |  i >= 1  |  0 <= i  |  0 < i  |  1 <= i
+func reverseCondIsValid(cond ast.Expr, indexName string) bool {
+	bin, ok := cond.(*ast.BinaryExpr)
+	if !ok {
+		return false
+	}
+
+	switch bin.Op {
+	case token.GEQ, token.GTR: // i >= 0 | i > 0 | i >= 1
+		if !isIdent(bin.X, indexName) {
+			return false
+		}
+		lit, ok := bin.Y.(*ast.BasicLit)
+		return ok && lit.Kind == token.INT && (lit.Value == "0" || lit.Value == "1")
+
+	case token.LEQ, token.LSS: // 0 <= i | 1 <= i | 0 < i
+		if !isIdent(bin.Y, indexName) {
+			return false
+		}
+		lit, ok := bin.X.(*ast.BasicLit)
+		return ok && lit.Kind == token.INT && (lit.Value == "0" || lit.Value == "1")
+	}
+
+	return false
+}
+
+// lenCallArg returns the single ident argument of a bare len(...) call.
+func lenCallArg(expr ast.Expr) (string, bool) {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return "", false
+	}
+	fn, ok := call.Fun.(*ast.Ident)
+	if !ok || fn.Name != "len" || len(call.Args) != 1 {
+		return "", false
+	}
+	arg, ok := call.Args[0].(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	return arg.Name, true
+}
+
+// lenCallArgMinusOne matches `len(s) - 1` and returns the slice name.
+func lenCallArgMinusOne(expr ast.Expr) (string, bool) {
+	bin, ok := expr.(*ast.BinaryExpr)
+	if !ok || bin.Op != token.SUB {
+		return "", false
+	}
+	if !isIntLit(bin.Y, "1") {
+		return "", false
+	}
+	return lenCallArg(bin.X)
+}
+
+// isIntLit returns true if expr is an integer literal with the given value.
+func isIntLit(expr ast.Expr, value string) bool {
+	lit, ok := expr.(*ast.BasicLit)
+	return ok && lit.Kind == token.INT && lit.Value == value
+}
+
+// isIncrement returns true for `name++` or `name += 1`.
+func isIncrement(post ast.Stmt, name string) bool {
+	switch s := post.(type) {
+	case *ast.IncDecStmt:
+		id, ok := s.X.(*ast.Ident)
+		return ok && s.Tok == token.INC && id.Name == name
+	case *ast.AssignStmt:
+		if s.Tok != token.ADD_ASSIGN || len(s.Lhs) != 1 || len(s.Rhs) != 1 {
+			return false
+		}
+		id, ok := s.Lhs[0].(*ast.Ident)
+		if !ok || id.Name != name {
+			return false
+		}
+		lit, ok := s.Rhs[0].(*ast.BasicLit)
+		return ok && lit.Kind == token.INT && lit.Value == "1"
+	}
+	return false
+}
+
+// isDecrement returns true for `name--` or `name -= 1`.
+func isDecrement(post ast.Stmt, name string) bool {
+	switch s := post.(type) {
+	case *ast.IncDecStmt:
+		id, ok := s.X.(*ast.Ident)
+		return ok && s.Tok == token.DEC && id.Name == name
+	case *ast.AssignStmt:
+		if s.Tok != token.SUB_ASSIGN || len(s.Lhs) != 1 || len(s.Rhs) != 1 {
+			return false
+		}
+		id, ok := s.Lhs[0].(*ast.Ident)
+		if !ok || id.Name != name {
+			return false
+		}
+		lit, ok := s.Rhs[0].(*ast.BasicLit)
+		return ok && lit.Kind == token.INT && lit.Value == "1"
+	}
+	return false
+}
+
+// isIdent returns true if expr is an *ast.Ident with the given name.
+func isIdent(expr ast.Expr, name string) bool {
+	id, ok := expr.(*ast.Ident)
+	return ok && id.Name == name
+}
+
+// findIdentInExpr does a shallow walk of expr to find the first *ast.Ident
+// whose Name matches target. Used to obtain a typed node for type-checking.
+func findIdentInExpr(expr ast.Expr, target string) *ast.Ident {
+	var found *ast.Ident
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found != nil {
+			return false
+		}
+		if id, ok := n.(*ast.Ident); ok && id.Name == target {
+			found = id
+			return false
+		}
+		return true
+	})
+	return found
 }
