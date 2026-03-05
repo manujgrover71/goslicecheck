@@ -18,15 +18,6 @@ func alreadyPreallocated2Args(src []int) []int {
 	return result
 }
 
-// rangeOverMap
-func rangeOverMap(src map[string]int) []string {
-	result := []string{}
-	for k := range src {
-		result = append(result, k)
-	}
-	return result
-}
-
 // noAppend
 func noAppend(src []int) int {
 	sum := 0

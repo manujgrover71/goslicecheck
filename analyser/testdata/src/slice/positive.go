@@ -1,5 +1,6 @@
 package slice
 
+// slice cases:
 // shortDecl
 func shortDecl(src []int) []int {
 	result := []int{}
@@ -40,4 +41,52 @@ func multipleLoops(src []int) ([]int, []int) {
 	}
 
 	return result1, result2
+}
+
+// Map cases:
+// mapRangeKey
+func mapRangeKey(src map[string]int) []string {
+	result := []string{}
+	for k := range src { // want `slice 'result' can be preallocated with capacity len\(src\)`
+		result = append(result, k)
+	}
+	return result
+}
+
+// mapRangeValue
+func mapRangeValue(src map[string]int) []int {
+	result := []int{}
+	for _, v := range src { // want `slice 'result' can be preallocated with capacity len\(src\)`
+		result = append(result, v)
+	}
+	return result
+}
+
+// mapRangeKeyValue
+func mapRangeKeyValue(src map[string]int) []string {
+	result := []string{}
+	for k, _ := range src { // want `slice 'result' can be preallocated with capacity len\(src\)`
+		result = append(result, k)
+	}
+	return result
+}
+
+// mapVarDecl
+func mapVarDecl(src map[string]int) []string {
+	var result []string
+	for k := range src { // want `slice 'result' can be preallocated with capacity len\(src\)`
+		result = append(result, k)
+	}
+	return result
+}
+
+// mapNamedType
+type UserMap map[string]int
+
+func mapNamedType(src UserMap) []string {
+	result := []string{}
+	for k := range src { // want `slice 'result' can be preallocated with capacity len\(src\)`
+		result = append(result, k)
+	}
+	return result
 }

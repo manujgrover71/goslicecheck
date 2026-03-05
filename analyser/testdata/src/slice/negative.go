@@ -18,15 +18,6 @@ func alreadyPreallocated2Args(src []int) []int {
 	return result
 }
 
-// rangeOverMap
-func rangeOverMap(src map[string]int) []string {
-	result := []string{}
-	for k := range src {
-		result = append(result, k)
-	}
-	return result
-}
-
 // noAppend
 func noAppend(src []int) int {
 	sum := 0
@@ -42,6 +33,15 @@ func mismatchedAppendTarget(src []int) []int {
 	result := []int{}
 	for _, v := range src {
 		result = append(other, v)
+	}
+	return result
+}
+
+// mapAlreadyPreallocated — should NOT trigger
+func mapAlreadyPreallocated(src map[string]int) []string {
+	result := make([]string, 0, len(src))
+	for k := range src {
+		result = append(result, k)
 	}
 	return result
 }
