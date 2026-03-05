@@ -46,9 +46,16 @@ func run(pass *analysis.Pass) (interface{}, error) {
 					if iterType == nil {
 						continue
 					}
-					if _, isSlice := iterType.(*types.Slice); !isSlice {
+
+					// Accept slices and maps — both have deterministic len().
+					// Using underlying to handle named slice/map types like `type MySlice []T`.
+					switch iterType.Underlying().(type) {
+					case *types.Slice, *types.Map:
+						// ok
+					default:
 						continue
 					}
+
 					iterExpr = s.X
 
 					targetName, found := findAppendTarget(s.Body)
@@ -184,7 +191,6 @@ func findAppendTarget(body *ast.BlockStmt) (string, bool) {
 // Using Uses[ident] on the slice variable avoids TypeOf on composite literals,
 // which returns fully-qualified package paths like "pkg.UserDTO".
 func findSliceElemType(pass *analysis.Pass, body *ast.BlockStmt, name string) string {
-	// Omit current package prefix; use short name for external packages.
 	qualifier := func(pkg *types.Package) string {
 		if pkg == pass.Pkg {
 			return ""
@@ -205,21 +211,27 @@ func findSliceElemType(pass *analysis.Pass, body *ast.BlockStmt, name string) st
 		if !ok || len(call.Args) == 0 {
 			continue
 		}
-		// Args[0] is the slice ident passed to append.
-		// Uses[ident] gives the declared *types.Var with the correct package.
-		sliceIdent, ok := call.Args[0].(*ast.Ident)
-		if !ok {
+
+		// Args[0] is the slice being appended to — skip it, we want Args[1+]
+		// to determine what element type is being collected.
+		if len(call.Args) < 2 {
 			continue
 		}
-		obj, ok := pass.TypesInfo.Uses[sliceIdent]
-		if !ok {
-			continue
+
+		appendedArg := call.Args[1]
+
+		// If the appended value is a plain ident, resolve via Uses.
+		// This handles both slice elem vars and map k/v vars correctly.
+		if argIdent, ok := appendedArg.(*ast.Ident); ok {
+			if obj, ok := pass.TypesInfo.Uses[argIdent]; ok {
+				return types.TypeString(obj.Type(), qualifier)
+			}
 		}
-		sl, ok := obj.Type().(*types.Slice)
-		if !ok {
-			continue
+
+		// Fallback: derive type from TypesInfo.Types for composite expressions.
+		if tv, ok := pass.TypesInfo.Types[appendedArg]; ok {
+			return types.TypeString(tv.Type, qualifier)
 		}
-		return types.TypeString(sl.Elem(), qualifier)
 	}
 
 	return "interface{}"
